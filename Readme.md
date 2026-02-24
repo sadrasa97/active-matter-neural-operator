@@ -1,319 +1,339 @@
+# Physics-Constrained Neural Operator for Active Matter
+
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-%E2%89%A51.10-red.svg)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+A physics-constrained Fourier Neural Operator (FNO) for learning macroscopic closure models of Active Brownian Particle (ABP) systems beyond the Toner-Tu validity regime.
+
+## Overview
+
+This project implements a **data-driven approach** to discover macroscopic evolution equations for active matter systems directly from microscopic simulations, without relying on phenomenological closure approximations.
+
+### Key Innovation
+
+> A physics-constrained neural operator can learn a **stable and generalizable macroscopic closure model** for systems of self-propelled particles, beyond the regime where hydrodynamic theories such as Toner-Tu equations remain valid.
+
+## Features
+
+- **Physics-Constrained Architecture**: Hard constraints for mass conservation and positivity
+- **Spectral Neural Operators**: Fourier Neural Operator with correct two-sided mode selection
+- **Active Brownian Particle Simulator**: Built-in ABP simulation with coarse-graining
+- **Baseline Comparisons**: MLP, Unconstrained FNO, and fitted Toner-Tu PDE
+- **Stability Analysis**: Lyapunov exponent estimation and spectral energy tracking
+- **Automatic Mixed Precision**: GPU-accelerated training with AMP
+- **Rotational Equivariance**: Data augmentation for rotation symmetry
+
+## Installation
+
+### Requirements
+
+```bash
+pip install torch numpy
+```
+
+### Optional (for enhanced performance)
+
+```bash
+# CUDA support (if not already installed)
+pip install torch --index-url https://download.pytorch.org/whl/cu118
+```
+
+## Quick Start
+
+### Run Full Pipeline
+
+```bash
+python main.py
+```
+
+This executes:
+1. **Verification Suite** — Validates physics constraints and gradient flow
+2. **Data Generation** — Simulates ABP trajectories across parameter regimes
+3. **Model Training** — Trains physics-constrained FNO with rollout loss
+4. **Trajectory Evaluation** — In-distribution and OOD generalization tests
+5. **Stability Analysis** — Lyapunov exponent and spectral energy evolution
+6. **Ablation Study** — Compares against baseline models
+
+## Architecture
+
+### Physics-Constrained FNO
+
+```
+Input: [ρ, Px, Py]  (B, 3, H, W)
+  │
+  ├─→ Lift: 3 → width (Conv2d + GELU)
+  │
+  ├─→ FNO Backbone (L layers)
+  │     ├─ SpectralConv2d (Fourier mixing)
+  │     └─ Pointwise Conv2d (channel mixing)
+  │
+  ├─→ Branch A: Flux J_θ = (Jx, Jy)
+  │     └─→ ∂_t ρ = -∇·J_θ  [mass-conserving]
+  │
+  └─→ Branch B: Polar tendency G_θ = (∂_t Px, ∂_t Py)
+```
+
+### Physics Constraints
+
+| Constraint | Implementation | Guarantee |
+|------------|----------------|-----------|
+| **Mass Conservation** | ∂_t ρ = -∇·J (spectral divergence) | ∫ ∂_t ρ dx = 0 exactly |
+| **Positivity** | ρ_{t+Δt} = Softplus(ρ_t + Δt·∂_t ρ) | ρ ≥ 0 everywhere |
+| **Translation Equivariance** | Spectral representation | Inherent in Fourier space |
+| **Rotational Equivariance** | 90° rotation augmentation | Enforced via data augmentation |
+| **Entropy Regularization** | L_ent = λ_e · mean(ρ log ρ) | Discourages unphysical clustering |
+
+### Spectral Convolution
+
+Correct two-sided mode selection for real FFT:
+
+```
+û = rfft2(u)  →  shape (B, C, H, W//2+1)
+
+Retained modes:
+  - Positive ky:  rows 0 : k_max
+  - Negative ky:  rows H-k_max : H
+  - Positive kx:  cols 0 : k_max
+
+Complex weights: R_pos, R_neg ∈ ℂ^(C_in × C_out × k_max × k_max)
+```
+
+## Mathematical Formulation
+
+### Microscopic Dynamics (ABP)
+
+Overdamped 2D Active Brownian Particles:
+
+```
+ẋ_i = v₀ e(θ_i) + √(2D_t) η_i
+θ̇_i = √(2D_r) ξ_i
+
+e(θ_i) = (cos θ_i, sin θ_i)
+```
+
+### Coarse-Grained Fields
+
+```
+ρ(x,t) = Σ_i W(x - x_i(t))          [density]
+P(x,t) = Σ_i e(θ_i) W(x - x_i(t))   [polarization]
+```
+
+### Target Operator
+
+Learn macroscopic closure without moment truncation:
+
+```
+∂_t ρ = F_θ(ρ, P)   enforced as: ∂_t ρ := -∇·J_θ(ρ, P)
+∂_t P = G_θ(ρ, P)
+```
+
+### Training Objective
+
+```
+L = L_data + λ_c L_continuity + λ_e L_entropy + λ_r L_rollout
+
+L_data     = ||ρ_pred - ρ_true||² + ||P_pred - P_true||²
+L_entropy  = mean(ρ log ρ)
+L_rollout  = (1/T) Σ_{t=1}^T γ^t · MSE(ρ^t_pred, ρ^t_true)
+```
+
+## Configuration
+
+### Training Parameters (`TrainConfig`)
+
+```python
+@dataclass
+class TrainConfig:
+    # Architecture
+    width: int = 64       # Feature width
+    n_layers: int = 4     # FNO layers
+    k_max: int = 16       # Fourier modes
+    
+    # Training
+    n_epochs: int = 60
+    batch_size: int = 8
+    lr: float = 3e-4
+    weight_decay: float = 1e-4
+    
+    # Loss weights
+    lambda_e: float = 1e-4    # Entropy regularization
+    lambda_r: float = 0.1     # Rollout loss
+    gamma_rollout: float = 0.9
+    
+    # Rollout stability
+    rollout_steps: int = 4
+    rollout_start_epoch: int = 10
+```
+
+### ABP Simulation Parameters
+
+```python
+@dataclass
+class ABPParams:
+    N: int = 1024         # Number of particles
+    L: float = 32.0       # Box size (periodic)
+    v0: float = 1.0       # Self-propulsion speed
+    D_t: float = 0.1      # Translational diffusion
+    D_r: float = 1.0      # Rotational diffusion
+    dt: float = 0.005     # Integration timestep
+    grid_H: int = 64      # Coarse-grid resolution
+    grid_W: int = 64
+    kernel_sigma: float = 1.0  # Gaussian smoothing
+```
+
+## Baseline Models
+
+The code includes three baseline models for comparison:
+
+| Model | Description | Constraints |
+|-------|-------------|-------------|
+| **MLPClosure** | Pixel-wise MLP (1×1 Convs) | None |
+| **UnconstrainedFNO** | Standard FNO | None |
+| **TonerTuClosure** | Fitted Toner-Tu PDE | Near-equilibrium theory |
+| **PhysicsConstrainedFNO** | Proposed method | Mass + Positivity |
+
+### Toner-Tu Equations
+
+```
+∂_t ρ = -v₀ ∇·P + D_ρ ∇²ρ
+∂_t P = -λ(P·∇)P - (α + β|P|²)P - (v₀/2)∇ρ + D_P ∇²P
+```
+
+Parameters (α, β, λ, D_ρ, D_P) are fitted from data.
+
+## Evaluation Metrics
+
+### Trajectory Evaluation
+
+- **L2 Error**: RMSE on density and polarization trajectories
+- **Mass Error**: |∫ρ_pred - ∫ρ_true| / ∫ρ_true
+- **Stability**: Binary (no NaN/Inf during rollout)
+- **Spectral Error**: MSE of isotropic energy spectrum E(k)
+- **Structure Factor Error**: MSE of static structure factor S(k)
+
+### Stability Analysis
+
+- **Lyapunov Exponent**: λ₁ = mean(log(||δz_{t+1}|| / ||δz_t||) / Δt)
+  - λ₁ < 0 → stable (perturbations decay)
+  - λ₁ > 0 → chaotic (perturbations grow)
+
+- **Spectral Energy Evolution**: E(k, t) over rollout time
+
+## Performance Notes
+
+### Computational Complexity
+
+```
+SpectralConv2d: O(B · C² · k_max² + B · C · H·W · log(H·W))
+FNO Forward:    O(L · B · C² · H·W · log(H·W))
+```
+
+### Memory Footprint (float32)
+
+```
+Activations: B × n_layers × width × H × W × 4 bytes
+Weights:     n_layers × width² × k_max² × 8 bytes (complex64)
+
+Example (B=8, L=4, width=64, H=W=64, k_max=16):
+  Activations: ~536 MB
+  Weights:     ~33 MB
+```
+
+### Optimization Tips
+
+1. `torch.compile(model)` — 2-3× speedup (PyTorch 2.0+)
+2. Mixed precision (`amp.autocast()`) — ~2× memory reduction
+3. Increase `k_max` to 16-24 for better spectral resolution
+4. Use `cudnn.benchmark = True` for fixed input sizes
+
+## Project Structure
+
+```
+FNO/
+├── main.py                     # Complete implementation
+├── README.md                   # This file
+├── abp_fno_checkpoint.pt       # Saved checkpoint (after training)
+└── .gitignore
+```
+
+## Output Example
+
+```
+2026-02-25 10:30:15 [INFO] Device: cuda | AMP: True
+2026-02-25 10:30:16 [INFO] ==================================================
+2026-02-25 10:30:16 [INFO] Physics-Constrained FNO for ABP Macroscopic Closure
+2026-02-25 10:30:16 [INFO] ==================================================
+
+[Phase 1] Verification suite...
+[✓] SpectralConv2d: shape OK, grad_norm=1.234e-03
+[✓] Mass conservation: max|∫∂_tρ dx| = 2.34e-06 < 1.00e-04
+[✓] Positivity: min ρ_new = 1.23e-04 ≥ 0
+...
+
+[Phase 4] Training physics-constrained FNO...
+  Model parameters: 1,234,567
+  Ep    1 | tr=2.34e-02 | val=2.45e-02 | lr=3.00e-04 | 12.3s
+  Ep    5 | tr=1.23e-02 | val=1.34e-02 | lr=2.85e-04 | 11.8s
+  ...
+  Ep   30 | tr=4.56e-03 | val=5.12e-03 | lr=1.20e-05 | 11.5s
+
+[Phase 7] Ablation study...
+╔══════════════════════════════════════════════════════════════════╗
+│ ABLATION TABLE — In-Distribution (Val)                           │
+╠══════════════════════════════════════════════════════════════════╣
+│ Model                l2_rho     l2_P     mass_error  stable     │
+│ physics_fno          1.23e-03   2.34e-03 1.23e-05    1.0        │
+│ unconstrained_fno    2.34e-03   3.45e-03 4.56e-02    1.0        │
+│ mlp                  5.67e-03   6.78e-03 1.23e-01    0.0        │
+│ toner_tu             8.90e-03   9.01e-03 2.34e-04    1.0        │
+╚══════════════════════════════════════════════════════════════════╝
+```
+
+## Theoretical Background
+
+### Why Beyond Toner-Tu?
+
+Toner-Tu equations are derived under assumptions:
+- Weak noise (small fluctuations)
+- Near-ordered state (small |P|)
+- Gradient expansion truncation at low order
+
+These break down in:
+- **High activity regimes** (large v₀)
+- **Motility-Induced Phase Separation (MIPS)**
+- **Strong noise conditions**
+
+### Neural Operator Advantage
+
+Learning the closure operator F_θ, G_θ directly from data:
+- No moment truncation bias
+- Captures non-local spatial correlations (via Fourier modes)
+- Generalizes to unseen parameter regimes
+- Maintains physical structure (mass, positivity)
+
+## Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+@software{sadrasa97_abp_fno_2026,
+  author = {Sadra Saadati},
+  title = {Physics-Constrained Neural Operator for Active Matter},
+  year = {2026},
+  url = {https://github.com/sadrasa97/active-matter-neural-operator}
+}
+```
+
+## License
+
+MIT License — see [LICENSE](LICENSE) for details.
+
+## Contact
+
+- **GitHub**: [@sadrasa97](https://github.com/sadrasa97)
+- **Repository**: [active-matter-neural-operator](https://github.com/sadrasa97/active-matter-neural-operator)
+
 ---
 
-# 3. Methodology
-
-## 3.1 Problem Statement
-
-We investigate whether a physics-constrained neural operator can learn a **stable and generalizable macroscopic closure model** for systems of self-propelled particles modeled as Active Brownian Particle (ABP), beyond the regime where hydrodynamic theories such as Toner–Tu equations remain valid.
-
-Specifically, we aim to learn the macroscopic evolution operator:
-
-[
-(\rho, \mathbf{P}) \mapsto \partial_t (\rho, \mathbf{P})
-]
-
-where:
-
-* (\rho(x,t)): coarse-grained density field
-* (\mathbf{P}(x,t)): polarization field
-
-without relying on moment-closure approximations.
-
----
-
-# 3.2 Microscopic System: Active Brownian Particles
-
-We consider (N) overdamped ABPs in 2D:
-
-[
-\dot{\mathbf{x}}_i = v_0 \mathbf{e}(\theta_i) + \sqrt{2D_t},\boldsymbol{\eta}_i(t)
-]
-[
-\dot{\theta}_i = \sqrt{2D_r},\xi_i(t)
-]
-
-where:
-
-* (v_0): self-propulsion speed
-* (D_t): translational diffusion
-* (D_r): rotational diffusion
-* (\mathbf{e}(\theta_i) = (\cos\theta_i, \sin\theta_i))
-
-We simulate the system under periodic boundary conditions across parameter regimes including:
-
-* Low and high density
-* Strong noise
-* Motility-induced phase separation (MIPS) regime
-
-These regimes intentionally extend beyond Toner–Tu validity.
-
----
-
-# 3.3 Coarse-Graining Procedure
-
-We construct Eulerian fields on a uniform grid:
-
-### Density
-
-[
-\rho(x,t) = \sum_i W(x - x_i(t))
-]
-
-### Polarization
-
-[
-\mathbf{P}(x,t) = \sum_i \mathbf{e}(\theta_i) W(x - x_i(t))
-]
-
-where (W) is a Gaussian kernel with bandwidth comparable to interaction length scale.
-
-Fields are normalized to ensure:
-
-[
-\int \rho(x,t),dx = N
-]
-
-This yields time-series data:
-
-[
-{(\rho^k, \mathbf{P}^k)}_{k=1}^{T}
-]
-
-for multiple parameter sets.
-
----
-
-# 3.4 Target Macroscopic Closure Formulation
-
-Instead of assuming Toner–Tu structure, we learn:
-
-[
-\partial_t \rho = \mathcal{F}*\theta(\rho, \mathbf{P})
-]
-[
-\partial_t \mathbf{P} = \mathcal{G}*\theta(\rho, \mathbf{P})
-]
-
-where (\mathcal{F}*\theta) and (\mathcal{G}*\theta) are nonlinear operators parameterized by a neural operator.
-
-This avoids explicit moment truncation.
-
----
-
-# 3.5 Neural Operator Architecture
-
-We adopt a physics-constrained version of the Fourier Neural Operator (FNO).
-
-### 3.5.1 Spectral Operator Layer
-
-For input field (u(x)):
-
-[
-\hat{u}_k = \mathcal{F}[u](k)
-]
-
-Truncated Fourier modes are transformed via learned kernel:
-
-[
-\hat{v}_k = R_k \hat{u}_k
-]
-
-where (R_k) is a complex weight tensor.
-
-Inverse transform yields spatial output.
-
-Stacking L layers gives:
-
-[
-u_{l+1} = \sigma( W u_l + \mathcal{K}_\theta(u_l) )
-]
-
----
-
-# 3.6 Physics Constraints
-
-To avoid black-box behavior, we enforce physical structure explicitly.
-
----
-
-## 3.6.1 Mass Conservation
-
-Continuity requires:
-
-[
-\partial_t \rho + \nabla \cdot \mathbf{J} = 0
-]
-
-We enforce this by:
-
-1. Learning flux field (\mathbf{J}_\theta)
-2. Defining:
-
-[
-\partial_t \rho := -\nabla \cdot \mathbf{J}_\theta
-]
-
-This guarantees:
-
-[
-\frac{d}{dt}\int \rho dx = 0
-]
-
-exactly (up to discretization).
-
----
-
-## 3.6.2 Rotational and Translational Equivariance
-
-We enforce symmetry by:
-
-* Training with random domain rotations
-* Using spectral representation (naturally translation equivariant)
-* Weight tying for isotropic kernels
-
----
-
-## 3.6.3 Positivity Constraint
-
-Density positivity is enforced via:
-
-[
-\rho_{t+\Delta t} = \text{Softplus}(\rho_t + \Delta t,\partial_t \rho)
-]
-
----
-
-## 3.6.4 Energy-like Regularization
-
-We introduce entropy-inspired regularization:
-
-[
-\mathcal{L}_{entropy} = \lambda_e \int \rho \log \rho , dx
-]
-
-to discourage unphysical clustering artifacts.
-
----
-
-# 3.7 Training Objective
-
-For discrete timestep prediction:
-
-[
-\mathcal{L} =
-\mathcal{L}_{data}
-
-* \lambda_c \mathcal{L}_{continuity}
-* \lambda_e \mathcal{L}_{entropy}
-  ]
-
-where:
-
-### Data Loss
-
-[
-\mathcal{L}_{data} =
-|\rho^{pred} - \rho^{true}|_2^2
-+
-|\mathbf{P}^{pred} - \mathbf{P}^{true}|_2^2
-]
-
-### Stability Loss
-
-Long-horizon rollout consistency over T steps.
-
----
-
-# 3.8 Generalization Regime
-
-Training:
-
-* Parameter subset: (v_0 \in [v_{min}, v_{mid}])
-
-Testing:
-
-* Unseen propulsion speeds
-* Unseen noise strengths
-* Higher density regimes
-
-Goal:
-Demonstrate operator-level generalization beyond Toner–Tu approximation.
-
----
-
-# 3.9 Baseline Models
-
-We compare against:
-
-1. Toner–Tu PDE fitted to data
-2. MLP-based closure model
-3. Unconstrained FNO
-
-Evaluation metrics:
-
-* L2 trajectory error
-* Long-time stability
-* Phase transition prediction accuracy
-* Energy spectrum preservation
-
----
-
-# 3.10 Stability Analysis
-
-We evaluate:
-
-1. Linear perturbation growth rates
-2. Spectral energy distribution
-3. Absence of numerical blow-up in long rollout
-
-Additionally, we examine whether learned operator preserves emergent band structures.
-
----
-
-# 3.11 Key Hypothesis
-
-We test:
-
-> A physics-constrained neural operator can learn a stable, generalizable macroscopic closure beyond the weak-noise and near-equilibrium regime where Toner–Tu theory is valid.
-
----
-
-# 3.12 Expected Contributions
-
-1. Data-driven closure beyond moment expansion.
-2. Physics-constrained neural operator for active matter.
-3. Stability and long-time generalization analysis.
-4. Insight into emergent hydrodynamic structure.
-
----
-
-# 3.13 Implementation Details
-
-* Spatial resolution: 64×64 or 128×128
-* Fourier modes retained: 16–24
-* Depth: 4–6 operator layers
-* Optimizer: AdamW
-* Spectral normalization for stability
-* Mixed precision training
-
----
-
-# 3.14 Reproducibility
-
-* Fixed random seeds
-* Open-source simulation code
-* Dataset generation scripts included
-* Hyperparameter grid provided
-
----
-
-# Final Positioning
-
-This methodology is not:
-
-* Pure ML benchmarking
-* Pure active matter simulation
-
-It directly addresses the **closure problem** in non-equilibrium active systems using structured operator learning.
-
----
+*This project implements research-grade code for physics-constrained machine learning in active matter systems.*
