@@ -63,12 +63,14 @@ Tensor shapes (B=batch, C=channels, H=height, W=width):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -78,6 +80,9 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -1060,7 +1065,9 @@ class ABPDataset(torch.utils.data.Dataset):
       input:  [ρ^k, Px^k, Py^k]    shape (3, H, W)
       target: [ρ^{k+1}, Px^{k+1}, Py^{k+1}]  shape (3, H, W)
 
-    Normalization: per-channel zero-mean, unit-variance (computed on train set).
+    Normalization:
+      - "physics": rho scaled by mean density (positive), P standardized
+      - "standard": per-channel zero-mean, unit-variance (legacy)
     Rotational augmentation (90° increments): enforces rotation equivariance.
 
     Polarization transformation under 90° CCW rotation:
@@ -1082,6 +1089,7 @@ class ABPDataset(torch.utils.data.Dataset):
         normalize:    bool = True,
         augment:      bool = False,   # rotational augmentation
         stats:        Optional[Dict[str, Tensor]] = None,
+        normalize_mode: str = "physics",
     ) -> None:
         # Collect (input, target) pairs
         self.samples: List[Tuple[np.ndarray, np.ndarray]] = []
@@ -1094,6 +1102,7 @@ class ABPDataset(torch.utils.data.Dataset):
 
         self.normalize = normalize
         self.augment   = augment
+        self.normalize_mode = normalize_mode
         self.rot_angles = [0, 90, 180, 270]
 
         if normalize:
@@ -1101,29 +1110,72 @@ class ABPDataset(torch.utils.data.Dataset):
 
     def _compute_stats(self) -> Dict[str, Tensor]:
         """
-        Compute per-channel mean and std over all training inputs.
+        Compute normalization statistics over all training inputs.
 
-        Shapes: mean (3, 1, 1), std (3, 1, 1)
+        Modes:
+          - physics: rho_scale (1,1,1), p_mean (2,1,1), p_std (2,1,1)
+          - standard: mean (3,1,1), std (3,1,1)
         """
         all_inp = np.stack([s[0] for s in self.samples], axis=0)   # (N, 3, H, W)
-        mean = all_inp.mean(axis=(0, 2, 3), keepdims=False)         # (3,)
-        std  = all_inp.std( axis=(0, 2, 3), keepdims=False) + 1e-8  # (3,)
-        return {
-            "mean": torch.tensor(mean[:, None, None], dtype=torch.float32),  # (3, 1, 1)
-            "std":  torch.tensor(std[:,  None, None], dtype=torch.float32),
-        }
+        if self.normalize_mode == "physics":
+            rho = all_inp[:, 0]  # (N, H, W)
+            P   = all_inp[:, 1:3]  # (N, 2, H, W)
+            rho_scale = float(rho.mean()) + 1e-8
+            p_mean = P.mean(axis=(0, 2, 3), keepdims=False)
+            p_std  = P.std(axis=(0, 2, 3), keepdims=False) + 1e-8
+            return {
+                "rho_scale": torch.tensor([[rho_scale]], dtype=torch.float32).view(1, 1, 1),
+                "p_mean": torch.tensor(p_mean[:, None, None], dtype=torch.float32),  # (2,1,1)
+                "p_std":  torch.tensor(p_std[:,  None, None], dtype=torch.float32),
+            }
+        if self.normalize_mode == "standard":
+            mean = all_inp.mean(axis=(0, 2, 3), keepdims=False)         # (3,)
+            std  = all_inp.std(axis=(0, 2, 3), keepdims=False) + 1e-8    # (3,)
+            return {
+                "mean": torch.tensor(mean[:, None, None], dtype=torch.float32),  # (3, 1, 1)
+                "std":  torch.tensor(std[:,  None, None], dtype=torch.float32),
+            }
+        raise ValueError(f"Unknown normalize_mode: {self.normalize_mode}")
+
+    def _stat(self, key: str, device: torch.device) -> Tensor:
+        val = self.stats[key]
+        if torch.is_tensor(val):
+            return val.to(device)
+        return torch.as_tensor(val, dtype=torch.float32, device=device)
 
     def normalize_field(self, x: Tensor) -> Tensor:
         """x: (..., 3, H, W)  normalized channel-wise."""
-        m = self.stats["mean"].to(x.device)
-        s = self.stats["std"].to(x.device)
-        return (x - m) / s
+        if self.normalize_mode == "standard":
+            m = self._stat("mean", x.device)
+            s = self._stat("std", x.device)
+            return (x - m) / s
+        if self.normalize_mode == "physics":
+            rho = x[..., 0:1, :, :]
+            P   = x[..., 1:3, :, :]
+            rho_scale = self._stat("rho_scale", x.device)
+            p_mean = self._stat("p_mean", x.device)
+            p_std  = self._stat("p_std", x.device)
+            rho_n = rho / rho_scale
+            P_n   = (P - p_mean) / p_std
+            return torch.cat([rho_n, P_n], dim=-3)
+        raise ValueError(f"Unknown normalize_mode: {self.normalize_mode}")
 
     def denormalize_field(self, x: Tensor) -> Tensor:
         """Inverse of normalize_field."""
-        m = self.stats["mean"].to(x.device)
-        s = self.stats["std"].to(x.device)
-        return x * s + m
+        if self.normalize_mode == "standard":
+            m = self._stat("mean", x.device)
+            s = self._stat("std", x.device)
+            return x * s + m
+        if self.normalize_mode == "physics":
+            rho = x[..., 0:1, :, :]
+            P   = x[..., 1:3, :, :]
+            rho_scale = self._stat("rho_scale", x.device)
+            p_mean = self._stat("p_mean", x.device)
+            p_std  = self._stat("p_std", x.device)
+            rho_p = rho * rho_scale
+            P_p   = P * p_std + p_mean
+            return torch.cat([rho_p, P_p], dim=-3)
+        raise ValueError(f"Unknown normalize_mode: {self.normalize_mode}")
 
     def _apply_rotation(
         self, inp: Tensor, tgt: Tensor, angle: int
@@ -1207,6 +1259,13 @@ class TrainConfig:
     log_every:  int   = 5
     # Augmentation
     augment:    bool  = True
+    # Normalization
+    normalize_mode: str = "physics"
+    # Output
+    results_dir: str = "results"
+    plot_rollout_steps: int = 30
+    save_plots: bool = True
+    save_metrics: bool = True
 
 
 class Trainer:
@@ -1377,6 +1436,113 @@ class Trainer:
 # SECTION 8: EVALUATION METRICS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _to_tensor_stat(v: Union[Tensor, np.ndarray, float, int], device: torch.device) -> Tensor:
+    if torch.is_tensor(v):
+        return v.to(device)
+    return torch.tensor(v, device=device, dtype=torch.float32)
+
+
+def normalize_fields(
+    rho: Tensor, Px: Tensor, Py: Tensor,
+    stats: Optional[Dict[str, Tensor]],
+    normalize_mode: str,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    if stats is None:
+        return rho, Px, Py
+    if normalize_mode == "standard":
+        mean = _to_tensor_stat(stats["mean"], rho.device)
+        std  = _to_tensor_stat(stats["std"],  rho.device)
+        rho_n = (rho - mean[0]) / std[0]
+        Px_n  = (Px  - mean[1]) / std[1]
+        Py_n  = (Py  - mean[2]) / std[2]
+        return rho_n, Px_n, Py_n
+    if normalize_mode == "physics":
+        rho_scale = _to_tensor_stat(stats["rho_scale"], rho.device)
+        p_mean    = _to_tensor_stat(stats["p_mean"],    rho.device)
+        p_std     = _to_tensor_stat(stats["p_std"],     rho.device)
+        rho_n = rho / rho_scale
+        Px_n  = (Px - p_mean[0]) / p_std[0]
+        Py_n  = (Py - p_mean[1]) / p_std[1]
+        return rho_n, Px_n, Py_n
+    raise ValueError(f"Unknown normalize_mode: {normalize_mode}")
+
+
+def denormalize_fields(
+    rho: Tensor, Px: Tensor, Py: Tensor,
+    stats: Optional[Dict[str, Tensor]],
+    normalize_mode: str,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    if stats is None:
+        return rho, Px, Py
+    if normalize_mode == "standard":
+        mean = _to_tensor_stat(stats["mean"], rho.device)
+        std  = _to_tensor_stat(stats["std"],  rho.device)
+        rho_p = rho * std[0] + mean[0]
+        Px_p  = Px  * std[1] + mean[1]
+        Py_p  = Py  * std[2] + mean[2]
+        return rho_p, Px_p, Py_p
+    if normalize_mode == "physics":
+        rho_scale = _to_tensor_stat(stats["rho_scale"], rho.device)
+        p_mean    = _to_tensor_stat(stats["p_mean"],    rho.device)
+        p_std     = _to_tensor_stat(stats["p_std"],     rho.device)
+        rho_p = rho * rho_scale
+        Px_p  = Px * p_std[0] + p_mean[0]
+        Py_p  = Py * p_std[1] + p_mean[1]
+        return rho_p, Px_p, Py_p
+    raise ValueError(f"Unknown normalize_mode: {normalize_mode}")
+
+
+@torch.no_grad()
+def rollout_predict(
+    model: Union[PhysicsConstrainedFNO, MLPClosure, UnconstrainedFNO, TonerTuClosure],
+    rho0: Tensor, Px0: Tensor, Py0: Tensor,
+    dt: float,
+    n_steps: int,
+) -> Tuple[Tensor, Tensor, Tensor, bool]:
+    if hasattr(model, "eval"):
+        model.eval()
+    rho_list, Px_list, Py_list = [rho0], [Px0], [Py0]
+    rho, Px, Py = rho0.clone(), Px0.clone(), Py0.clone()
+    stable = True
+    for _ in range(n_steps):
+        rho, Px, Py = model.step(rho, Px, Py, dt)
+        if (torch.isnan(rho).any() or torch.isinf(rho).any()
+                or torch.isnan(Px).any() or torch.isinf(Px).any()
+                or torch.isnan(Py).any() or torch.isinf(Py).any()):
+            stable = False
+            break
+        rho_list.append(rho)
+        Px_list.append(Px)
+        Py_list.append(Py)
+    return (
+        torch.stack(rho_list, dim=1),
+        torch.stack(Px_list,  dim=1),
+        torch.stack(Py_list,  dim=1),
+        stable,
+    )
+
+
+def compute_time_series_metrics(
+    rho_pred: Tensor, rho_true: Tensor,
+    Px_pred: Tensor, Px_true: Tensor,
+    Py_pred: Tensor, Py_true: Tensor,
+) -> Dict[str, Tensor]:
+    rmse_rho_t = (rho_pred - rho_true).pow(2).mean(dim=(0, 2, 3)).sqrt()
+    rmse_Px_t  = (Px_pred  - Px_true).pow(2).mean(dim=(0, 2, 3))
+    rmse_Py_t  = (Py_pred  - Py_true).pow(2).mean(dim=(0, 2, 3))
+    rmse_P_t   = (0.5 * (rmse_Px_t + rmse_Py_t)).sqrt()
+
+    mass_pred = rho_pred.sum(dim=(-2, -1)).mean(dim=0)
+    mass_true = rho_true.sum(dim=(-2, -1)).mean(dim=0)
+    rel_mass_error_t = (mass_pred - mass_true) / (mass_true.abs() + 1e-8)
+
+    return {
+        "rmse_rho_t": rmse_rho_t,
+        "rmse_P_t": rmse_P_t,
+        "rel_mass_error_t": rel_mass_error_t,
+    }
+
+
 def energy_spectrum(field: Tensor) -> Tensor:
     """
     Isotropic (azimuthally averaged) energy spectrum E(k).
@@ -1450,7 +1616,10 @@ def evaluate_trajectory(
     rho_true: Tensor, Px_true: Tensor, Py_true: Tensor,
     dt:       float,
     n_steps:  int,
-) -> Dict[str, float]:
+    stats:    Optional[Dict[str, Tensor]] = None,
+    normalize_mode: str = "standard",
+    return_traj: bool = False,
+) -> Union[Dict[str, float], Tuple[Dict[str, float], Tuple[Tensor, Tensor, Tensor]]]:
     """
     Full trajectory rollout evaluation.
 
@@ -1461,65 +1630,86 @@ def evaluate_trajectory(
       n_steps: rollout length
 
     Returns dict:
-      l2_rho:       sqrt-MSE on density trajectory
-      l2_P:         sqrt-MSE on polarization trajectory
-      mass_error:   |Σ ρ_pred - Σ ρ_true| / Σ ρ_true (time-averaged)
-      stable:       1.0 if no NaN/Inf, 0.0 otherwise
-      spectral_err: sqrt-MSE of isotropic energy spectrum at final step
-      structure_err:sqrt-MSE of structure factor at final step
+      l2_rho, l2_P:           RMSE on trajectories
+      mae_rho, mae_P:         MAE on trajectories
+      rel_l2_rho, rel_l2_P:   relative L2 error on trajectories
+      corr_rho, corr_P:       spatial correlation at final step
+      mass_error:             |sum rho_pred - sum rho_true| / sum rho_true (time-avg)
+      spectral_err:           RMSE of energy spectrum at final step
+      structure_err:          RMSE of structure factor at final step
+      pol_mag_rmse:           RMSE of polarization magnitude at final step
+      stable:                 1.0 if no NaN/Inf, 0.0 otherwise
     """
-    if hasattr(model, 'eval'):
-        model.eval()
-
-    rho_list, Px_list, Py_list = [rho0], [Px0], [Py0]
-    rho, Px, Py = rho0.clone(), Px0.clone(), Py0.clone()
-    stable = True
-
-    for _ in range(n_steps):
-        rho, Px, Py = model.step(rho, Px, Py, dt)
-        if (torch.isnan(rho).any() or torch.isinf(rho).any()
-                or torch.isnan(Px).any() or torch.isinf(Px).any()):
-            stable = False
-            break
-        rho_list.append(rho)
-        Px_list.append(Px)
-        Py_list.append(Py)
-
-    nan_result = {
-        "l2_rho":       float("inf"),
-        "l2_P":         float("inf"),
-        "mass_error":   float("inf"),
-        "stable":       0.0,
-        "spectral_err": float("inf"),
-        "structure_err":float("inf"),
-    }
+    rho0_n, Px0_n, Py0_n = normalize_fields(rho0, Px0, Py0, stats, normalize_mode)
+    rho_pred_n, Px_pred_n, Py_pred_n, stable = rollout_predict(
+        model, rho0_n, Px0_n, Py0_n, dt, n_steps
+    )
     if not stable:
-        return nan_result
+        nan_result = {
+            "l2_rho": float("inf"),
+            "l2_P": float("inf"),
+            "mae_rho": float("inf"),
+            "mae_P": float("inf"),
+            "rel_l2_rho": float("inf"),
+            "rel_l2_P": float("inf"),
+            "corr_rho": 0.0,
+            "corr_P": 0.0,
+            "mass_error": float("inf"),
+            "spectral_err": float("inf"),
+            "structure_err": float("inf"),
+            "pol_mag_rmse": float("inf"),
+            "stable": 0.0,
+        }
+        return (nan_result, None) if return_traj else nan_result
 
-    T_pred = len(rho_list)
+    rho_pred, Px_pred, Py_pred = denormalize_fields(
+        rho_pred_n, Px_pred_n, Py_pred_n, stats, normalize_mode
+    )
+
+    T_pred = rho_pred.shape[1]
     T_eval = min(T_pred, rho_true.shape[1])
+    rho_pred_t = rho_pred[:, :T_eval]
+    Px_pred_t  = Px_pred[:,  :T_eval]
+    Py_pred_t  = Py_pred[:,  :T_eval]
 
-    rho_pred_t = torch.stack(rho_list[:T_eval], dim=1)   # (B, T_eval, H, W)
-    Px_pred_t  = torch.stack(Px_list[:T_eval],  dim=1)
-    Py_pred_t  = torch.stack(Py_list[:T_eval],  dim=1)
+    rho_true_t = rho_true[:, :T_eval]
+    Px_true_t  = Px_true[:,  :T_eval]
+    Py_true_t  = Py_true[:,  :T_eval]
 
     # L2 trajectory error (RMSE)
-    l2_rho = F.mse_loss(rho_pred_t, rho_true[:, :T_eval]).sqrt().item()
+    l2_rho = F.mse_loss(rho_pred_t, rho_true_t).sqrt().item()
     l2_P   = (
-        0.5 * F.mse_loss(Px_pred_t, Px_true[:, :T_eval])
-        + 0.5 * F.mse_loss(Py_pred_t, Py_true[:, :T_eval])
+        0.5 * F.mse_loss(Px_pred_t, Px_true_t)
+        + 0.5 * F.mse_loss(Py_pred_t, Py_true_t)
     ).sqrt().item()
 
-    # Mass conservation error: |∫ρ_pred - ∫ρ_true| / ∫ρ_true
-    mass_pred = rho_pred_t.sum(dim=(-2, -1))             # (B, T_eval)
-    mass_true = rho_true[:, :T_eval].sum(dim=(-2, -1))
-    mass_error = (
-        (mass_pred - mass_true).abs() / (mass_true.abs() + 1e-8)
-    ).mean().item()
+    # MAE trajectory error
+    mae_rho = F.l1_loss(rho_pred_t, rho_true_t).item()
+    mae_P   = (
+        0.5 * F.l1_loss(Px_pred_t, Px_true_t)
+        + 0.5 * F.l1_loss(Py_pred_t, Py_true_t)
+    ).item()
+
+    # Relative L2 error on trajectories
+    rel_l2_rho = (rho_pred_t - rho_true_t).pow(2).sum().div(
+        rho_true_t.pow(2).sum() + 1e-8
+    ).sqrt().item()
+    rel_l2_Px = (Px_pred_t - Px_true_t).pow(2).sum().div(
+        Px_true_t.pow(2).sum() + 1e-8
+    ).sqrt().item()
+    rel_l2_Py = (Py_pred_t - Py_true_t).pow(2).sum().div(
+        Py_true_t.pow(2).sum() + 1e-8
+    ).sqrt().item()
+    rel_l2_P = 0.5 * (rel_l2_Px + rel_l2_Py)
+
+    # Mass conservation error: |sum rho_pred - sum rho_true| / sum rho_true
+    mass_pred = rho_pred_t.sum(dim=(-2, -1))
+    mass_true = rho_true_t.sum(dim=(-2, -1))
+    mass_error = ((mass_pred - mass_true).abs() / (mass_true.abs() + 1e-8)).mean().item()
 
     # Spectral energy error at final timestep
     rho_f_pred = rho_pred_t[:, -1]
-    rho_f_true = rho_true[:, T_eval - 1]
+    rho_f_true = rho_true_t[:, -1]
     spec_pred  = energy_spectrum(rho_f_pred)
     spec_true  = energy_spectrum(rho_f_true)
     spectral_err = F.mse_loss(spec_pred, spec_true).sqrt().item()
@@ -1529,17 +1719,193 @@ def evaluate_trajectory(
     sf_true = structure_factor(rho_f_true)
     struct_err = F.mse_loss(sf_pred, sf_true).sqrt().item()
 
-    return {
-        "l2_rho":       l2_rho,
-        "l2_P":         l2_P,
-        "mass_error":   mass_error,
-        "stable":       1.0,
+    # Spatial correlation at final timestep
+    def _corrcoef(a: Tensor, b: Tensor) -> float:
+        a = a.flatten()
+        b = b.flatten()
+        a = a - a.mean()
+        b = b - b.mean()
+        denom = (a.norm() * b.norm()) + 1e-8
+        return (a @ b / denom).item()
+
+    corr_rho = _corrcoef(rho_f_pred, rho_f_true)
+    corr_Px  = _corrcoef(Px_pred_t[:, -1], Px_true_t[:, -1])
+    corr_Py  = _corrcoef(Py_pred_t[:, -1], Py_true_t[:, -1])
+    corr_P   = 0.5 * (corr_Px + corr_Py)
+
+    # Polarization magnitude RMSE at final step
+    pol_mag_pred = torch.sqrt(Px_pred_t[:, -1] ** 2 + Py_pred_t[:, -1] ** 2)
+    pol_mag_true = torch.sqrt(Px_true_t[:, -1] ** 2 + Py_true_t[:, -1] ** 2)
+    pol_mag_rmse = F.mse_loss(pol_mag_pred, pol_mag_true).sqrt().item()
+
+    metrics = {
+        "l2_rho": l2_rho,
+        "l2_P": l2_P,
+        "mae_rho": mae_rho,
+        "mae_P": mae_P,
+        "rel_l2_rho": rel_l2_rho,
+        "rel_l2_P": rel_l2_P,
+        "corr_rho": corr_rho,
+        "corr_P": corr_P,
+        "mass_error": mass_error,
         "spectral_err": spectral_err,
-        "structure_err":struct_err,
+        "structure_err": struct_err,
+        "pol_mag_rmse": pol_mag_rmse,
+        "stable": 1.0,
     }
 
+    if return_traj:
+        return metrics, (rho_pred_t, Px_pred_t, Py_pred_t)
+    return metrics
 
-# ═══════════════════════════════════════════════════════════════════════════════
+def _to_numpy(x: Tensor) -> np.ndarray:
+    return x.detach().cpu().numpy()
+
+
+def ensure_dir(path: Union[str, Path]) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def save_history_csv(history: Dict[str, List[float]], out_path: Union[str, Path]) -> None:
+    lines = ["epoch,train_total,train_data,val_total,val_data,val_entropy,val_rollout"]
+    n = len(history.get("train_total", []))
+    for i in range(n):
+        row = [
+            str(i + 1),
+            f"{history['train_total'][i]:.6e}",
+            f"{history['train_data'][i]:.6e}",
+            f"{history['val_total'][i]:.6e}",
+            f"{history['val_data'][i]:.6e}",
+            f"{history['val_entropy'][i]:.6e}",
+            f"{history['val_rollout'][i]:.6e}",
+        ]
+        lines.append(",".join(row))
+    Path(out_path).write_text("\n".join(lines), encoding="utf-8")
+
+
+def save_json(path: Union[str, Path], payload: Dict) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=True)
+
+
+def plot_loss_curves(history: Dict[str, List[float]], out_path: Union[str, Path]) -> None:
+    epochs = np.arange(1, len(history.get("train_total", [])) + 1)
+    if len(epochs) == 0:
+        return
+    fig, ax = plt.subplots(figsize=(6.0, 4.0))
+    ax.plot(epochs, history["train_total"], label="train_total")
+    ax.plot(epochs, history["val_total"], label="val_total")
+    ax.plot(epochs, history["train_data"], label="train_data", alpha=0.7)
+    ax.plot(epochs, history["val_data"], label="val_data", alpha=0.7)
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    ax.set_yscale("log")
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_field_compare(
+    true_field: Tensor,
+    pred_field: Tensor,
+    title: str,
+    out_path: Union[str, Path],
+    cmap: str = "viridis",
+) -> None:
+    t = _to_numpy(true_field)
+    p = _to_numpy(pred_field)
+    err = p - t
+    vmin = np.min([t.min(), p.min()])
+    vmax = np.max([t.max(), p.max()])
+    emax = np.max(np.abs(err))
+    if emax < 1e-8:
+        emax = 1e-8
+    fig, axes = plt.subplots(1, 3, figsize=(10.5, 3.4))
+    im0 = axes[0].imshow(t, cmap=cmap, vmin=vmin, vmax=vmax)
+    axes[0].set_title("true")
+    im1 = axes[1].imshow(p, cmap=cmap, vmin=vmin, vmax=vmax)
+    axes[1].set_title("pred")
+    im2 = axes[2].imshow(err, cmap="coolwarm", vmin=-emax, vmax=emax)
+    axes[2].set_title("error")
+    for ax in axes:
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.suptitle(title)
+    fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+    fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+    fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_spectrum(
+    spec_true: Tensor,
+    spec_pred: Tensor,
+    out_path: Union[str, Path],
+    ylabel: str,
+) -> None:
+    s_t = _to_numpy(spec_true)
+    s_p = _to_numpy(spec_pred)
+    s_t = np.maximum(s_t, 1e-12)
+    s_p = np.maximum(s_p, 1e-12)
+    k = np.arange(len(s_t))
+    fig, ax = plt.subplots(figsize=(5.5, 4.0))
+    ax.plot(k, s_t, label="true")
+    ax.plot(k, s_p, label="pred")
+    ax.set_xlabel("k")
+    ax.set_ylabel(ylabel)
+    ax.set_yscale("log")
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_time_series(
+    t: np.ndarray,
+    series: Dict[str, np.ndarray],
+    ylabel: str,
+    out_path: Union[str, Path],
+) -> None:
+    fig, ax = plt.subplots(figsize=(6.0, 4.0))
+    for label, values in series.items():
+        ax.plot(t, values, label=label)
+    ax.set_xlabel("time")
+    ax.set_ylabel(ylabel)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_rollout_diagnostics(
+    t: np.ndarray,
+    rmse_rho: np.ndarray,
+    rmse_P: np.ndarray,
+    rel_mass_error: np.ndarray,
+    out_path: Union[str, Path],
+) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.0))
+    axes[0].plot(t, rmse_rho, label="rmse_rho")
+    axes[0].plot(t, rmse_P, label="rmse_P")
+    axes[0].set_xlabel("time")
+    axes[0].set_ylabel("rmse")
+    axes[0].legend(frameon=False)
+
+    axes[1].plot(t, rel_mass_error, label="rel_mass_error")
+    axes[1].set_xlabel("time")
+    axes[1].set_ylabel("relative mass error")
+    axes[1].legend(frameon=False)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
 # SECTION 9: STABILITY ANALYSIS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2013,7 +2379,8 @@ def run_ablation(
 
         val_m = evaluate_trajectory(
             mdl, rho0_v, Px0_v, Py0_v, rho_tv, Px_tv, Py_tv,
-            dt=cfg.dt_field, n_steps=T_eval
+            dt=cfg.dt_field, n_steps=T_eval,
+            stats=dataset.stats, normalize_mode=cfg.normalize_mode
         )
 
         # ── Evaluate on test (OOD) ────────────────────────────────────────────
@@ -2028,7 +2395,8 @@ def run_ablation(
 
         ood_m = evaluate_trajectory(
             mdl, rho0_ood, Px0_ood, Py0_ood, rho_to, Px_to, Py_to,
-            dt=cfg.dt_field, n_steps=T_ood
+            dt=cfg.dt_field, n_steps=T_ood,
+            stats=dataset.stats, normalize_mode=cfg.normalize_mode
         )
 
         results[name] = {
@@ -2127,16 +2495,37 @@ def main() -> None:
 
     # ── Phase 3: Dataset construction ────────────────────────────────────────
     log.info("\n[Phase 3] Building datasets...")
-    train_ds = ABPDataset(train_trajs, normalize=True, augment=cfg.augment)
-    val_ds   = ABPDataset(val_trajs,   normalize=True, augment=False, stats=train_ds.stats)
-    test_ds  = ABPDataset(test_trajs,  normalize=True, augment=False, stats=train_ds.stats)
+    train_ds = ABPDataset(
+        train_trajs, normalize=True, augment=cfg.augment, normalize_mode=cfg.normalize_mode
+    )
+    val_ds   = ABPDataset(
+        val_trajs, normalize=True, augment=False, stats=train_ds.stats,
+        normalize_mode=cfg.normalize_mode
+    )
+    test_ds  = ABPDataset(
+        test_trajs, normalize=True, augment=False, stats=train_ds.stats,
+        normalize_mode=cfg.normalize_mode
+    )
     log.info(
         f"  Samples: train={len(train_ds)} | val={len(val_ds)} | test={len(test_ds)}"
     )
-    log.info(
-        f"  Stats: ρ_mean={train_ds.stats['mean'][0,0,0]:.3f} "
-        f"ρ_std={train_ds.stats['std'][0,0,0]:.3f}"
-    )
+    if cfg.normalize_mode == "physics":
+        rho_scale = float(train_ds.stats["rho_scale"][0, 0, 0])
+        p_mean_x = float(train_ds.stats["p_mean"][0, 0, 0])
+        p_mean_y = float(train_ds.stats["p_mean"][1, 0, 0])
+        p_std_x  = float(train_ds.stats["p_std"][0, 0, 0])
+        p_std_y  = float(train_ds.stats["p_std"][1, 0, 0])
+        log.info(
+            f"  Stats: rho_scale={rho_scale:.3f} "
+            f"P_mean=({p_mean_x:.3f},{p_mean_y:.3f}) "
+            f"P_std=({p_std_x:.3f},{p_std_y:.3f})"
+        )
+    else:
+        log.info(
+            f"  Stats: rho_mean={train_ds.stats['mean'][0,0,0]:.3f} "
+            f"rho_std={train_ds.stats['std'][0,0,0]:.3f}"
+        )
+
 
     def make_loader(ds, shuffle: bool) -> torch.utils.data.DataLoader:
         return torch.utils.data.DataLoader(
@@ -2164,7 +2553,9 @@ def main() -> None:
     # ── Phase 5: Trajectory evaluation ───────────────────────────────────────
     log.info("\n[Phase 5] Trajectory evaluation...")
 
-    def eval_on_traj(traj: Dict, label: str, rollout_steps: int) -> Dict:
+    def eval_on_traj(
+        traj: Dict, label: str, rollout_steps: int, return_traj: bool = False
+    ) -> Union[Dict, Tuple[Dict, Tuple[Tensor, Tensor, Tensor], Tuple[Tensor, Tensor, Tensor], np.ndarray]]:
         T_eval   = min(rollout_steps, traj["rho"].shape[0] - 1)
         rho0_t   = torch.tensor(traj["rho"][0:1], device=DEVICE)
         Px0_t    = torch.tensor(traj["Px"][0:1],  device=DEVICE)
@@ -2172,14 +2563,23 @@ def main() -> None:
         rho_true = torch.tensor(traj["rho"][:T_eval+1], device=DEVICE).unsqueeze(0)
         Px_true  = torch.tensor(traj["Px"][:T_eval+1],  device=DEVICE).unsqueeze(0)
         Py_true  = torch.tensor(traj["Py"][:T_eval+1],  device=DEVICE).unsqueeze(0)
-        metrics  = evaluate_trajectory(
+        metrics_out = evaluate_trajectory(
             model, rho0_t, Px0_t, Py0_t, rho_true, Px_true, Py_true,
-            dt=cfg.dt_field, n_steps=T_eval
+            dt=cfg.dt_field, n_steps=T_eval,
+            stats=train_ds.stats, normalize_mode=cfg.normalize_mode,
+            return_traj=return_traj
         )
-        log.info(f"  {label}: {metrics}")
-        return metrics
+        if return_traj:
+            metrics, pred_traj = metrics_out
+            t_true = traj["t"][:T_eval+1]
+            log.info(f"  {label}: {metrics}")
+            return metrics, pred_traj, (rho_true, Px_true, Py_true), t_true
+        log.info(f"  {label}: {metrics_out}")
+        return metrics_out
 
-    val_metrics = eval_on_traj(val_trajs[0],  "Val  (ID)", rollout_steps=30)
+    val_metrics, val_pred_traj, val_true_traj, val_t = eval_on_traj(
+        val_trajs[0], "Val  (ID)", rollout_steps=cfg.plot_rollout_steps, return_traj=True
+    )
     ood_metrics = [
         eval_on_traj(t, f"OOD-{i}", rollout_steps=20)
         for i, t in enumerate(test_trajs)
@@ -2188,9 +2588,12 @@ def main() -> None:
     # ── Phase 6: Stability analysis ───────────────────────────────────────────
     log.info("\n[Phase 6] Stability analysis...")
     traj = val_trajs[0]
-    rho0_s = torch.tensor(traj["rho"][0:1], device=DEVICE)
-    Px0_s  = torch.tensor(traj["Px"][0:1],  device=DEVICE)
-    Py0_s  = torch.tensor(traj["Py"][0:1],  device=DEVICE)
+    rho0_s_raw = torch.tensor(traj["rho"][0:1], device=DEVICE)
+    Px0_s_raw  = torch.tensor(traj["Px"][0:1],  device=DEVICE)
+    Py0_s_raw  = torch.tensor(traj["Py"][0:1],  device=DEVICE)
+    rho0_s, Px0_s, Py0_s = normalize_fields(
+        rho0_s_raw, Px0_s_raw, Py0_s_raw, train_ds.stats, cfg.normalize_mode
+    )
 
     lyap = linear_perturbation_growth_rate(
         model, rho0_s, Px0_s, Py0_s, n_steps=30, dt=cfg.dt_field
@@ -2207,7 +2610,53 @@ def main() -> None:
         f"t=end → {spec_evo[-1,1].item():.4e}"
     )
 
-    # ── Phase 7: Ablation study ───────────────────────────────────────────────
+    # Phase 6.5: Plots and metrics artifacts
+    results_dir = None
+    if cfg.save_plots or cfg.save_metrics:
+        results_dir = ensure_dir(Path(__file__).resolve().parent / cfg.results_dir)
+
+    if cfg.save_plots:
+        if val_pred_traj is None:
+            log.warning("  Plots skipped: no valid trajectory")
+        else:
+            rho_pred_t, Px_pred_t, Py_pred_t = val_pred_traj
+            rho_true_t, Px_true_t, Py_true_t = val_true_traj
+            ts = compute_time_series_metrics(
+                rho_pred_t, rho_true_t, Px_pred_t, Px_true_t, Py_pred_t, Py_true_t
+            )
+            t_plot = np.asarray(val_t)
+
+            plot_loss_curves(trainer.history, results_dir / "loss_curves.png")
+            plot_field_compare(
+                rho_true_t[0, -1], rho_pred_t[0, -1],
+                "density (final)", results_dir / "rho_snapshot.png"
+            )
+            pol_true = torch.sqrt(Px_true_t ** 2 + Py_true_t ** 2)
+            pol_pred = torch.sqrt(Px_pred_t ** 2 + Py_pred_t ** 2)
+            plot_field_compare(
+                pol_true[0, -1], pol_pred[0, -1],
+                "polarization magnitude (final)",
+                results_dir / "polmag_snapshot.png"
+            )
+
+            spec_true = energy_spectrum(rho_true_t[:, -1])
+            spec_pred = energy_spectrum(rho_pred_t[:, -1])
+            plot_spectrum(spec_true, spec_pred, results_dir / "energy_spectrum.png", ylabel="E(k)")
+
+            sf_true = structure_factor(rho_true_t[:, -1])
+            sf_pred = structure_factor(rho_pred_t[:, -1])
+            plot_spectrum(sf_true, sf_pred, results_dir / "structure_factor.png", ylabel="S(k)")
+
+            plot_rollout_diagnostics(
+                t_plot,
+                _to_numpy(ts["rmse_rho_t"]),
+                _to_numpy(ts["rmse_P_t"]),
+                _to_numpy(ts["rel_mass_error_t"]),
+                results_dir / "rollout_diagnostics.png",
+            )
+            log.info(f"  Plots saved -> {results_dir}")
+
+    # Phase 7: Ablation study
     log.info("\n[Phase 7] Ablation study...")
     ablation_results = run_ablation(
         train_loader, val_loader, train_ds,
@@ -2215,6 +2664,34 @@ def main() -> None:
         n_epochs_ablation=15,
     )
     print_ablation_table(ablation_results)
+
+    # Phase 7.5: Save metrics and artifacts
+    if cfg.save_metrics:
+        if results_dir is None:
+            results_dir = ensure_dir(Path(__file__).resolve().parent / cfg.results_dir)
+
+        cfg_dict = {k: getattr(cfg, k) for k in cfg.__dataclass_fields__}
+        summary = {
+            "config": cfg_dict,
+            "n_params": n_params,
+            "val_metrics": val_metrics,
+            "ood_metrics": ood_metrics,
+            "lyapunov": lyap,
+            "spectral_energy": {
+                "k1_t0": float(spec_evo[0, 1].item()),
+                "k1_tend": float(spec_evo[-1, 1].item()),
+            },
+            "ablation": {
+                name: {
+                    "n_params": res["n_params"],
+                    "val": res["val"],
+                    "ood": res["ood"],
+                } for name, res in ablation_results.items()
+            },
+        }
+        save_json(results_dir / "metrics.json", summary)
+        save_history_csv(trainer.history, results_dir / "history.csv")
+        log.info(f"  Metrics saved -> {results_dir}")
 
     # ── Phase 8: Summary ──────────────────────────────────────────────────────
     log.info("═" * 70)
