@@ -215,7 +215,9 @@ Parameters (α, β, λ, D_ρ, D_P) are fitted from data.
 ### Trajectory Evaluation
 
 - **L2 Error**: RMSE on density and polarization trajectories
-- **Mass Error**: |∫ρ_pred - ∫ρ_true| / ∫ρ_true
+- **R2 Score**: Coefficient of determination over full trajectories
+- **Mass Error**: |∫ρ_pred - ∫ρ_true| / ∫ρ_true (mean + max over time)
+- **Negativity Fraction**: Fraction of predicted ρ values below 0
 - **Stability**: Binary (no NaN/Inf during rollout)
 - **Spectral Error**: MSE of isotropic energy spectrum E(k)
 - **Structure Factor Error**: MSE of static structure factor S(k)

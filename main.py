@@ -80,6 +80,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.amp import GradScaler, autocast
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -650,6 +651,71 @@ class PhysicsConstrainedFNO(nn.Module):
         # Optional exact mass conservation correction
         if enforce_mass:
             mass_before = rho.sum(dim=(-2, -1), keepdim=True)   # (B, 1, 1)
+            mass_after  = rho_new.sum(dim=(-2, -1), keepdim=True)
+            rho_new = rho_new * (mass_before / (mass_after + 1e-10))
+
+        return rho_new, Px_new, Py_new
+
+    def rk4_step(
+        self,
+        rho: Tensor, Px: Tensor, Py: Tensor,
+        dt: float,
+        enforce_mass: bool = True,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Fourth-order Runge-Kutta (RK4) time integration for higher accuracy.
+
+        RK4 scheme:
+          k1 = f(y_t)
+          k2 = f(y_t + dt/2 * k1)
+          k3 = f(y_t + dt/2 * k2)
+          k4 = f(y_t + dt * k3)
+          y_{t+1} = y_t + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+
+        Args:
+          rho, Px, Py: (B, H, W) — current state
+          dt: timestep
+          enforce_mass: if True, re-normalize ρ after integration
+
+        Returns:
+          rho_new, Px_new, Py_new: (B, H, W)
+        """
+        # k1 = f(y_t)
+        u = torch.stack([rho, Px, Py], dim=1)
+        dt_rho1, dt_Px1, dt_Py1 = self.forward(u)
+
+        # k2 = f(y_t + dt/2 * k1)
+        rho2 = rho + 0.5 * dt * dt_rho1
+        Px2  = Px  + 0.5 * dt * dt_Px1
+        Py2  = Py  + 0.5 * dt * dt_Py1
+        u2 = torch.stack([rho2, Px2, Py2], dim=1)
+        dt_rho2, dt_Px2, dt_Py2 = self.forward(u2)
+
+        # k3 = f(y_t + dt/2 * k2)
+        rho3 = rho + 0.5 * dt * dt_rho2
+        Px3  = Px  + 0.5 * dt * dt_Px2
+        Py3  = Py  + 0.5 * dt * dt_Py2
+        u3 = torch.stack([rho3, Px3, Py3], dim=1)
+        dt_rho3, dt_Px3, dt_Py3 = self.forward(u3)
+
+        # k4 = f(y_t + dt * k3)
+        rho4 = rho + dt * dt_rho3
+        Px4  = Px  + dt * dt_Px3
+        Py4  = Py  + dt * dt_Py3
+        u4 = torch.stack([rho4, Px4, Py4], dim=1)
+        dt_rho4, dt_Px4, dt_Py4 = self.forward(u4)
+
+        # y_{t+1} = y_t + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+        rho_new = rho + (dt / 6.0) * (dt_rho1 + 2*dt_rho2 + 2*dt_rho3 + dt_rho4)
+        Px_new  = Px  + (dt / 6.0) * (dt_Px1  + 2*dt_Px2  + 2*dt_Px3  + dt_Px4)
+        Py_new  = Py  + (dt / 6.0) * (dt_Py1  + 2*dt_Py2  + 2*dt_Py3  + dt_Py4)
+
+        # Hard positivity (apply after RK4 combination)
+        rho_new = F.softplus(rho_new)
+
+        # Optional exact mass conservation correction
+        if enforce_mass:
+            mass_before = rho.sum(dim=(-2, -1), keepdim=True)
             mass_after  = rho_new.sum(dim=(-2, -1), keepdim=True)
             rho_new = rho_new * (mass_before / (mass_after + 1e-10))
 
@@ -1231,25 +1297,25 @@ class ABPDataset(torch.utils.data.Dataset):
 @dataclass
 class TrainConfig:
     # Architecture
-    width:    int   = 64
-    n_layers: int   = 4
-    k_max:    int   = 16
+    width:    int   = 96       # increased from 64 for better capacity
+    n_layers: int   = 6        # increased from 4 for deeper representation
+    k_max:    int   = 20       # increased from 16 for better spectral resolution
     # Training
-    n_epochs:      int   = 60
-    batch_size:    int   = 8
-    lr:            float = 3e-4
+    n_epochs:      int   = 50       # increased from 30 for better convergence
+    batch_size:    int   = 6
+    lr:            float = 2e-4     # slightly reduced for stability
     weight_decay:  float = 1e-4
     grad_clip:     float = 1.0
     # Loss weights
     lambda_c:      float = 1e-3
-    lambda_e:      float = 1e-4
-    lambda_r:      float = 0.1
-    gamma_rollout: float = 0.9
+    lambda_e:      float = 5e-5     # reduced entropy weight
+    lambda_r:      float = 0.15     # increased rollout weight for stability
+    gamma_rollout: float = 0.95     # increased discount for longer horizon
     # Rollout stability training
-    rollout_steps: int   = 4      # steps for multi-step loss
-    rollout_start_epoch: int = 10 # epoch to begin rollout loss
+    rollout_steps: int   = 5        # increased from 4
+    rollout_start_epoch: int = 8    # start rollout loss earlier
     # Scheduler
-    T_0:  int = 20   # CosineAnnealingWarmRestarts period
+    T_0:  int = 15   # CosineAnnealingWarmRestarts period
     T_mult: int = 2
     # Grid
     H:          int   = 64
@@ -1266,6 +1332,8 @@ class TrainConfig:
     plot_rollout_steps: int = 30
     save_plots: bool = True
     save_metrics: bool = True
+    # Time integration
+    use_rk4: bool = False  # Use RK4 for inference (slower but more accurate)
 
 
 class Trainer:
@@ -1308,7 +1376,7 @@ class Trainer:
         self.scheduler = CosineAnnealingWarmRestarts(
             self.optimizer, T_0=cfg.T_0, T_mult=cfg.T_mult, eta_min=1e-6
         )
-        self.scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
+        self.scaler = GradScaler("cuda", enabled=USE_AMP)
         self.history: Dict[str, List[float]] = {
             "train_total": [], "train_data": [],
             "val_total":   [], "val_data":   [],
@@ -1375,7 +1443,7 @@ class Trainer:
             tgt = tgt.to(DEVICE, non_blocking=True)
             self.optimizer.zero_grad(set_to_none=True)
 
-            ctx = torch.cuda.amp.autocast() if USE_AMP else nullcontext()
+            ctx = autocast(device_type="cuda") if USE_AMP else nullcontext()
             with ctx:
                 losses = self._compute_loss(inp, tgt, epoch)
                 loss = losses["total"]
@@ -1498,14 +1566,22 @@ def rollout_predict(
     rho0: Tensor, Px0: Tensor, Py0: Tensor,
     dt: float,
     n_steps: int,
+    use_rk4: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, bool]:
     if hasattr(model, "eval"):
         model.eval()
     rho_list, Px_list, Py_list = [rho0], [Px0], [Py0]
     rho, Px, Py = rho0.clone(), Px0.clone(), Py0.clone()
     stable = True
+    
+    # Check if model supports RK4
+    has_rk4 = isinstance(model, PhysicsConstrainedFNO) and use_rk4
+    
     for _ in range(n_steps):
-        rho, Px, Py = model.step(rho, Px, Py, dt)
+        if has_rk4:
+            rho, Px, Py = model.rk4_step(rho, Px, Py, dt, enforce_mass=True)
+        else:
+            rho, Px, Py = model.step(rho, Px, Py, dt, enforce_mass=True)
         if (torch.isnan(rho).any() or torch.isinf(rho).any()
                 or torch.isnan(Px).any() or torch.isinf(Px).any()
                 or torch.isnan(Py).any() or torch.isinf(Py).any()):
@@ -1536,10 +1612,22 @@ def compute_time_series_metrics(
     mass_true = rho_true.sum(dim=(-2, -1)).mean(dim=0)
     rel_mass_error_t = (mass_pred - mass_true) / (mass_true.abs() + 1e-8)
 
+    polmag_pred = torch.sqrt(Px_pred ** 2 + Py_pred ** 2)
+    polmag_true = torch.sqrt(Px_true ** 2 + Py_true ** 2)
+    mean_polmag_pred_t = polmag_pred.mean(dim=(0, 2, 3))
+    mean_polmag_true_t = polmag_true.mean(dim=(0, 2, 3))
+
+    mean_rho_pred_t = rho_pred.mean(dim=(0, 2, 3))
+    mean_rho_true_t = rho_true.mean(dim=(0, 2, 3))
+
     return {
         "rmse_rho_t": rmse_rho_t,
         "rmse_P_t": rmse_P_t,
         "rel_mass_error_t": rel_mass_error_t,
+        "mean_polmag_pred_t": mean_polmag_pred_t,
+        "mean_polmag_true_t": mean_polmag_true_t,
+        "mean_rho_pred_t": mean_rho_pred_t,
+        "mean_rho_true_t": mean_rho_true_t,
     }
 
 
@@ -1609,6 +1697,15 @@ def structure_factor(rho: Tensor) -> Tensor:
     return S
 
 
+def r2_score(pred: Tensor, true: Tensor) -> float:
+    """Compute R^2 for arbitrary-shaped tensors."""
+    pred_f = pred.flatten()
+    true_f = true.flatten()
+    ss_res = (pred_f - true_f).pow(2).sum()
+    ss_tot = (true_f - true_f.mean()).pow(2).sum()
+    return (1.0 - ss_res / (ss_tot + 1e-8)).item()
+
+
 @torch.no_grad()
 def evaluate_trajectory(
     model:    Union[PhysicsConstrainedFNO, MLPClosure, UnconstrainedFNO, TonerTuClosure],
@@ -1619,6 +1716,7 @@ def evaluate_trajectory(
     stats:    Optional[Dict[str, Tensor]] = None,
     normalize_mode: str = "standard",
     return_traj: bool = False,
+    use_rk4:  bool = False,
 ) -> Union[Dict[str, float], Tuple[Dict[str, float], Tuple[Tensor, Tensor, Tensor]]]:
     """
     Full trajectory rollout evaluation.
@@ -1628,13 +1726,17 @@ def evaluate_trajectory(
       rho_true, Px_true, Py_true: (B, T+1, H, W) ground truth trajectory
       dt:      field timestep
       n_steps: rollout length
+      use_rk4: use RK4 time integration for higher accuracy (PhysicsConstrainedFNO only)
 
     Returns dict:
       l2_rho, l2_P:           RMSE on trajectories
       mae_rho, mae_P:         MAE on trajectories
       rel_l2_rho, rel_l2_P:   relative L2 error on trajectories
-      corr_rho, corr_P:       spatial correlation at final step
+      r2_rho, r2_P:           R^2 over full trajectory
       mass_error:             |sum rho_pred - sum rho_true| / sum rho_true (time-avg)
+      mass_error_max:         max |mass error| over time
+      neg_rho_frac:           fraction of negative density values (pred)
+      rho_min:                minimum predicted density
       spectral_err:           RMSE of energy spectrum at final step
       structure_err:          RMSE of structure factor at final step
       pol_mag_rmse:           RMSE of polarization magnitude at final step
@@ -1642,7 +1744,7 @@ def evaluate_trajectory(
     """
     rho0_n, Px0_n, Py0_n = normalize_fields(rho0, Px0, Py0, stats, normalize_mode)
     rho_pred_n, Px_pred_n, Py_pred_n, stable = rollout_predict(
-        model, rho0_n, Px0_n, Py0_n, dt, n_steps
+        model, rho0_n, Px0_n, Py0_n, dt, n_steps, use_rk4=use_rk4
     )
     if not stable:
         nan_result = {
@@ -1652,12 +1754,17 @@ def evaluate_trajectory(
             "mae_P": float("inf"),
             "rel_l2_rho": float("inf"),
             "rel_l2_P": float("inf"),
-            "corr_rho": 0.0,
-            "corr_P": 0.0,
+            "r2_rho": float("-inf"),
+            "r2_P": float("-inf"),
             "mass_error": float("inf"),
+            "mass_error_max": float("inf"),
+            "neg_rho_frac": float("inf"),
+            "rho_min": float("inf"),
             "spectral_err": float("inf"),
             "structure_err": float("inf"),
             "pol_mag_rmse": float("inf"),
+            "rmse_rho_final": float("inf"),
+            "rmse_P_final": float("inf"),
             "stable": 0.0,
         }
         return (nan_result, None) if return_traj else nan_result
@@ -1705,11 +1812,25 @@ def evaluate_trajectory(
     # Mass conservation error: |sum rho_pred - sum rho_true| / sum rho_true
     mass_pred = rho_pred_t.sum(dim=(-2, -1))
     mass_true = rho_true_t.sum(dim=(-2, -1))
-    mass_error = ((mass_pred - mass_true).abs() / (mass_true.abs() + 1e-8)).mean().item()
+    rel_mass_err_t = (mass_pred - mass_true) / (mass_true.abs() + 1e-8)
+    mass_error = rel_mass_err_t.abs().mean().item()
+    mass_error_max = rel_mass_err_t.abs().max().item()
 
-    # Spectral energy error at final timestep
+    # Final-step fields
     rho_f_pred = rho_pred_t[:, -1]
     rho_f_true = rho_true_t[:, -1]
+    Px_f_pred  = Px_pred_t[:, -1]
+    Px_f_true  = Px_true_t[:, -1]
+    Py_f_pred  = Py_pred_t[:, -1]
+    Py_f_true  = Py_true_t[:, -1]
+
+    rmse_rho_final = F.mse_loss(rho_f_pred, rho_f_true).sqrt().item()
+    rmse_P_final = (
+        0.5 * F.mse_loss(Px_f_pred, Px_f_true)
+        + 0.5 * F.mse_loss(Py_f_pred, Py_f_true)
+    ).sqrt().item()
+
+    # Spectral energy error at final timestep
     spec_pred  = energy_spectrum(rho_f_pred)
     spec_true  = energy_spectrum(rho_f_true)
     spectral_err = F.mse_loss(spec_pred, spec_true).sqrt().item()
@@ -1719,24 +1840,20 @@ def evaluate_trajectory(
     sf_true = structure_factor(rho_f_true)
     struct_err = F.mse_loss(sf_pred, sf_true).sqrt().item()
 
-    # Spatial correlation at final timestep
-    def _corrcoef(a: Tensor, b: Tensor) -> float:
-        a = a.flatten()
-        b = b.flatten()
-        a = a - a.mean()
-        b = b - b.mean()
-        denom = (a.norm() * b.norm()) + 1e-8
-        return (a @ b / denom).item()
-
-    corr_rho = _corrcoef(rho_f_pred, rho_f_true)
-    corr_Px  = _corrcoef(Px_pred_t[:, -1], Px_true_t[:, -1])
-    corr_Py  = _corrcoef(Py_pred_t[:, -1], Py_true_t[:, -1])
-    corr_P   = 0.5 * (corr_Px + corr_Py)
+    # R^2 over trajectories (aggregate)
+    r2_rho = r2_score(rho_pred_t, rho_true_t)
+    r2_Px  = r2_score(Px_pred_t, Px_true_t)
+    r2_Py  = r2_score(Py_pred_t, Py_true_t)
+    r2_P   = 0.5 * (r2_Px + r2_Py)
 
     # Polarization magnitude RMSE at final step
-    pol_mag_pred = torch.sqrt(Px_pred_t[:, -1] ** 2 + Py_pred_t[:, -1] ** 2)
-    pol_mag_true = torch.sqrt(Px_true_t[:, -1] ** 2 + Py_true_t[:, -1] ** 2)
+    pol_mag_pred = torch.sqrt(Px_f_pred ** 2 + Py_f_pred ** 2)
+    pol_mag_true = torch.sqrt(Px_f_true ** 2 + Py_f_true ** 2)
     pol_mag_rmse = F.mse_loss(pol_mag_pred, pol_mag_true).sqrt().item()
+
+    # Positivity / range diagnostics
+    neg_rho_frac = (rho_pred_t < 0).float().mean().item()
+    rho_min = rho_pred_t.min().item()
 
     metrics = {
         "l2_rho": l2_rho,
@@ -1745,12 +1862,17 @@ def evaluate_trajectory(
         "mae_P": mae_P,
         "rel_l2_rho": rel_l2_rho,
         "rel_l2_P": rel_l2_P,
-        "corr_rho": corr_rho,
-        "corr_P": corr_P,
+        "r2_rho": r2_rho,
+        "r2_P": r2_P,
         "mass_error": mass_error,
+        "mass_error_max": mass_error_max,
+        "neg_rho_frac": neg_rho_frac,
+        "rho_min": rho_min,
         "spectral_err": spectral_err,
         "structure_err": struct_err,
         "pol_mag_rmse": pol_mag_rmse,
+        "rmse_rho_final": rmse_rho_final,
+        "rmse_P_final": rmse_P_final,
         "stable": 1.0,
     }
 
@@ -1842,6 +1964,41 @@ def plot_field_compare(
     plt.close(fig)
 
 
+def plot_scatter_compare(
+    true_field: Tensor,
+    pred_field: Tensor,
+    title: str,
+    out_path: Union[str, Path],
+    max_points: int = 60000,
+    seed: int = 0,
+) -> None:
+    t = _to_numpy(true_field).ravel()
+    p = _to_numpy(pred_field).ravel()
+    if t.size == 0:
+        return
+    if t.size > max_points:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(t.size, size=max_points, replace=False)
+        t = t[idx]
+        p = p[idx]
+
+    vmin = float(np.min([t.min(), p.min()]))
+    vmax = float(np.max([t.max(), p.max()]))
+    if vmax - vmin < 1e-12:
+        vmax = vmin + 1e-12
+
+    fig, ax = plt.subplots(figsize=(4.6, 4.6))
+    hb = ax.hexbin(t, p, gridsize=70, bins="log", cmap="magma")
+    ax.plot([vmin, vmax], [vmin, vmax], "k--", lw=1.0)
+    ax.set_xlabel("true")
+    ax.set_ylabel("pred")
+    ax.set_title(title)
+    fig.colorbar(hb, ax=ax, fraction=0.046, pad=0.04, label="count")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
 def plot_spectrum(
     spec_true: Tensor,
     spec_pred: Tensor,
@@ -1860,6 +2017,32 @@ def plot_spectrum(
     ax.set_ylabel(ylabel)
     ax.set_yscale("log")
     ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_observables(
+    t: np.ndarray,
+    mean_rho_true: np.ndarray,
+    mean_rho_pred: np.ndarray,
+    mean_polmag_true: np.ndarray,
+    mean_polmag_pred: np.ndarray,
+    out_path: Union[str, Path],
+) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.0))
+    axes[0].plot(t, mean_rho_true, label="true")
+    axes[0].plot(t, mean_rho_pred, label="pred")
+    axes[0].set_xlabel("time")
+    axes[0].set_ylabel("mean density")
+    axes[0].legend(frameon=False)
+
+    axes[1].plot(t, mean_polmag_true, label="true")
+    axes[1].plot(t, mean_polmag_pred, label="pred")
+    axes[1].set_xlabel("time")
+    axes[1].set_ylabel("mean |P|")
+    axes[1].legend(frameon=False)
+
     fig.tight_layout()
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
@@ -2324,7 +2507,7 @@ def run_ablation(
         log.info(f"  Parameters: {n_p:,}")
 
         opt    = AdamW(mdl.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-        scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
+        scaler = GradScaler("cuda", enabled=USE_AMP)
 
         for epoch in range(1, n_epochs_ablation + 1):
             mdl.train()
@@ -2332,7 +2515,7 @@ def run_ablation(
                 inp, tgt = inp.to(DEVICE), tgt.to(DEVICE)
                 opt.zero_grad(set_to_none=True)
 
-                ctx = torch.cuda.amp.autocast() if USE_AMP else nullcontext()
+                ctx = autocast(device_type="cuda") if USE_AMP else nullcontext()
                 with ctx:
                     rho, Px, Py = inp[:, 0], inp[:, 1], inp[:, 2]
 
@@ -2412,7 +2595,16 @@ def run_ablation(
 
 def print_ablation_table(results: Dict[str, Dict]) -> None:
     """Print formatted ablation comparison table."""
-    metrics = ["l2_rho", "l2_P", "mass_error", "spectral_err", "stable"]
+    metrics = [
+        "l2_rho",
+        "l2_P",
+        "r2_rho",
+        "r2_P",
+        "mass_error",
+        "mass_error_max",
+        "neg_rho_frac",
+        "stable",
+    ]
     header_w = 22
     col_w    = 12
 
@@ -2453,22 +2645,23 @@ def main() -> None:
     log.info("═" * 70)
 
     cfg = TrainConfig(
-        width      = 32,       # paper: 64 (reduced for speed)
-        n_layers   = 4,
-        k_max      = 8,        # paper: 16–24 (reduced for speed)
-        n_epochs   = 30,       # paper: 100+ (reduced for demo)
+        width      = 96,       # increased for better capacity
+        n_layers   = 6,        # deeper representation
+        k_max      = 20,       # better spectral resolution
+        n_epochs   = 50,       # better convergence
         batch_size = 6,
-        lr         = 3e-4,
-        lambda_e   = 1e-4,
-        lambda_r   = 0.1,
-        gamma_rollout = 0.9,
-        rollout_steps = 3,
-        rollout_start_epoch = 10,
+        lr         = 2e-4,
+        lambda_e   = 5e-5,
+        lambda_r   = 0.15,
+        gamma_rollout = 0.95,
+        rollout_steps = 5,
+        rollout_start_epoch = 8,
         H = 64, W = 64,
         dt_field   = 0.05,
         log_every  = 5,
         augment    = True,
         T_0 = 15, T_mult = 2,
+        use_rk4    = True,     # Use RK4 for inference
     )
 
     # ── Phase 1: Verification suite ───────────────────────────────────────────
@@ -2567,7 +2760,8 @@ def main() -> None:
             model, rho0_t, Px0_t, Py0_t, rho_true, Px_true, Py_true,
             dt=cfg.dt_field, n_steps=T_eval,
             stats=train_ds.stats, normalize_mode=cfg.normalize_mode,
-            return_traj=return_traj
+            return_traj=return_traj,
+            use_rk4=cfg.use_rk4,
         )
         if return_traj:
             metrics, pred_traj = metrics_out
@@ -2626,11 +2820,23 @@ def main() -> None:
             )
             t_plot = np.asarray(val_t)
 
+            # ── Generate all plots with detailed logging ──────────────────────
+            log.info("\n  Generating visualization artifacts...")
+
+            # Loss curves
             plot_loss_curves(trainer.history, results_dir / "loss_curves.png")
+            log.info(f"    ✓ loss_curves.png - Training/validation loss vs epoch")
+
+            # Density snapshot comparison
             plot_field_compare(
                 rho_true_t[0, -1], rho_pred_t[0, -1],
                 "density (final)", results_dir / "rho_snapshot.png"
             )
+            rho_final_mae = F.l1_loss(rho_pred_t[0, -1], rho_true_t[0, -1]).item()
+            rho_final_mse = F.mse_loss(rho_pred_t[0, -1], rho_true_t[0, -1]).item()
+            log.info(f"    ✓ rho_snapshot.png - Density field comparison (MAE={rho_final_mae:.4f}, MSE={rho_final_mse:.4e})")
+
+            # Polarization magnitude
             pol_true = torch.sqrt(Px_true_t ** 2 + Py_true_t ** 2)
             pol_pred = torch.sqrt(Px_pred_t ** 2 + Py_pred_t ** 2)
             plot_field_compare(
@@ -2638,15 +2844,67 @@ def main() -> None:
                 "polarization magnitude (final)",
                 results_dir / "polmag_snapshot.png"
             )
+            polmag_final_mae = F.l1_loss(pol_pred[0, -1], pol_true[0, -1]).item()
+            polmag_final_mse = F.mse_loss(pol_pred[0, -1], pol_true[0, -1]).item()
+            log.info(f"    ✓ polmag_snapshot.png - Polarization magnitude (MAE={polmag_final_mae:.4f}, MSE={polmag_final_mse:.4e})")
 
+            # Density scatter
+            plot_scatter_compare(
+                rho_true_t[0, -1], rho_pred_t[0, -1],
+                "density scatter (final)", results_dir / "rho_scatter.png"
+            )
+            rho_corr = torch.corrcoef(torch.stack([
+                rho_true_t[0, -1].flatten(),
+                rho_pred_t[0, -1].flatten()
+            ]))[0, 1].item()
+            log.info(f"    ✓ rho_scatter.png - Density scatter (Pearson r={rho_corr:.4f})")
+
+            # Polarization magnitude scatter
+            plot_scatter_compare(
+                pol_true[0, -1], pol_pred[0, -1],
+                "polarization magnitude scatter (final)",
+                results_dir / "polmag_scatter.png"
+            )
+            polmag_corr = torch.corrcoef(torch.stack([
+                pol_true[0, -1].flatten(),
+                pol_pred[0, -1].flatten()
+            ]))[0, 1].item()
+            log.info(f"    ✓ polmag_scatter.png - Polarization scatter (Pearson r={polmag_corr:.4f})")
+
+            # Energy spectrum
             spec_true = energy_spectrum(rho_true_t[:, -1])
             spec_pred = energy_spectrum(rho_pred_t[:, -1])
             plot_spectrum(spec_true, spec_pred, results_dir / "energy_spectrum.png", ylabel="E(k)")
+            spec_rmse = F.mse_loss(spec_pred, spec_true).sqrt().item()
+            spec_mae = F.l1_loss(spec_pred, spec_true).item()
+            log.info(f"    ✓ energy_spectrum.png - Energy spectrum E(k) (RMSE={spec_rmse:.4f}, MAE={spec_mae:.4f})")
 
+            # Structure factor
             sf_true = structure_factor(rho_true_t[:, -1])
             sf_pred = structure_factor(rho_pred_t[:, -1])
             plot_spectrum(sf_true, sf_pred, results_dir / "structure_factor.png", ylabel="S(k)")
+            sf_rmse = F.mse_loss(sf_pred, sf_true).sqrt().item()
+            sf_mae = F.l1_loss(sf_pred, sf_true).item()
+            log.info(f"    ✓ structure_factor.png - Structure factor S(k) (RMSE={sf_rmse:.4f}, MAE={sf_mae:.4f})")
 
+            # Observables time series
+            plot_observables(
+                t_plot,
+                _to_numpy(ts["mean_rho_true_t"]),
+                _to_numpy(ts["mean_rho_pred_t"]),
+                _to_numpy(ts["mean_polmag_true_t"]),
+                _to_numpy(ts["mean_polmag_pred_t"]),
+                results_dir / "observables.png",
+            )
+            mean_rho_true_avg = _to_numpy(ts["mean_rho_true_t"]).mean()
+            mean_rho_pred_avg = _to_numpy(ts["mean_rho_pred_t"]).mean()
+            mean_rho_error_pct = abs(mean_rho_pred_avg - mean_rho_true_avg) / (mean_rho_true_avg + 1e-8) * 100
+            mean_polmag_true_avg = _to_numpy(ts["mean_polmag_true_t"]).mean()
+            mean_polmag_pred_avg = _to_numpy(ts["mean_polmag_pred_t"]).mean()
+            mean_polmag_error_pct = abs(mean_polmag_pred_avg - mean_polmag_true_avg) / (mean_polmag_true_avg + 1e-8) * 100
+            log.info(f"    ✓ observables.png - Time series (ρ error={mean_rho_error_pct:.2f}%, |P| error={mean_polmag_error_pct:.2f}%)")
+
+            # Rollout diagnostics
             plot_rollout_diagnostics(
                 t_plot,
                 _to_numpy(ts["rmse_rho_t"]),
@@ -2654,7 +2912,12 @@ def main() -> None:
                 _to_numpy(ts["rel_mass_error_t"]),
                 results_dir / "rollout_diagnostics.png",
             )
-            log.info(f"  Plots saved -> {results_dir}")
+            rmse_rho_avg = _to_numpy(ts["rmse_rho_t"]).mean()
+            rmse_P_avg = _to_numpy(ts["rmse_P_t"]).mean()
+            mass_err_avg = _to_numpy(ts["rel_mass_error_t"]).mean()
+            log.info(f"    ✓ rollout_diagnostics.png - RMSE(ρ)={rmse_rho_avg:.4f}, RMSE(P)={rmse_P_avg:.4f}, Mass err={mass_err_avg:.4e}")
+
+            log.info(f"\n  All plots saved → {results_dir}")
 
     # Phase 7: Ablation study
     log.info("\n[Phase 7] Ablation study...")
@@ -2704,7 +2967,11 @@ def main() -> None:
     log.info(f"  Final val loss:       {trainer.history['val_total'][-1]:.4e}")
     log.info(f"  Val L2(ρ):            {val_metrics['l2_rho']:.4e}")
     log.info(f"  Val L2(P):            {val_metrics['l2_P']:.4e}")
+    log.info(f"  Val R2(ρ):            {val_metrics['r2_rho']:.4f}")
+    log.info(f"  Val R2(P):            {val_metrics['r2_P']:.4f}")
     log.info(f"  Val mass error:       {val_metrics['mass_error']:.4e}")
+    log.info(f"  Val mass error max:   {val_metrics['mass_error_max']:.4e}")
+    log.info(f"  Val neg ρ fraction:   {val_metrics['neg_rho_frac']:.4e}")
     log.info(f"  Val spectral error:   {val_metrics['spectral_err']:.4e}")
     for i, om in enumerate(ood_metrics):
         log.info(f"  OOD-{i} L2(ρ):        {om['l2_rho']:.4e} (stable={om['stable']:.0f})")
